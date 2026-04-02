@@ -1,48 +1,22 @@
 """
-fii_dii_scraper.py — NSE-only FII/DII data scraper.
+fii_dii_scraper.py — Multi-source FII/DII data scraper with cloud-server support.
 
-WHY NSE ONLY:
-  NSE is the authoritative source. Multiple third-party sites
-  just re-publish NSE data with potential delays and formatting
-  differences, adding failure points without adding accuracy.
+PROBLEM:
+  Render / AWS / GCP cloud IPs are blocked by NSE's Akamai Bot Manager.
+  This scraper uses a 5-tier fallback strategy:
 
-HOW NSE BLOCKS SCRAPERS (and how we solve it):
-  NSE uses Akamai Bot Manager which validates:
-    1. TLS fingerprint  (Python ≠ Chrome → blocked)
-    2. HTTP/2 settings
-    3. JavaScript challenges (bm_sz cookie)
-    4. Cookie chain: nsit → nseappid → ak_bmsc → bm_sv
+  Tier 1: curl_cffi      — Chrome TLS impersonation → NSE API (best locally)
+  Tier 2: NSE Archives CSV — static file server, no Akamai (may work on cloud)
+  Tier 3: MoneyControl    — HTML table scraping (cloud-friendly, no Akamai)
+  Tier 4: Capital Market   — simple HTML scraping (cloud-friendly)
+  Tier 5: Plain requests  — last resort NSE attempt
 
-  SOLUTION — 3-tier approach, all NSE sources:
-    Tier 1: curl_cffi  — mimics Chrome TLS fingerprint exactly.
-                         Solves Akamai without Selenium.
-                         Requires: pip install curl-cffi
-    Tier 2: NSE Archives CSV — nsearchives.nseindia.com is a
-                         static file server, no Akamai protection.
-                         Slightly delayed (EOD batch), but accurate.
-    Tier 3: Plain requests with retry — works on some networks
-                         where Akamai is less aggressive, or when
-                         the session cookie from Tier 1 is reused.
-
-NSE API RESPONSE STRUCTURE:
-  Endpoint: GET /api/fiidiiTradeReact
-  Returns a JSON array, typically 2 entries:
-    [
-      {
-        "category": "FII/FPI *",
-        "buyValue":  "14523.45",   # Crores, string
-        "sellValue": "12411.34",   # Crores, string
-        "netValue":  "2112.11",    # Can be negative: "-469.13"
-        "date":      "28-Mar-2026"
-      },
-      {
-        "category": "DII",
-        ...same fields...
-      }
-    ]
+CACHING:
+  Successful fetches are cached in-memory for 30 minutes to avoid
+  repeated scraping. Cache is server-lifetime scoped (resets on restart).
 
 INSTALL:
-  pip install curl-cffi requests
+  pip install curl-cffi requests beautifulsoup4
 """
 
 import csv
@@ -51,12 +25,48 @@ import json
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# In-Memory Cache (30-minute TTL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_cache_lock = threading.Lock()
+_cached_data: Optional[dict] = None
+_cache_timestamp: Optional[datetime] = None
+_CACHE_TTL_MINUTES = 30
+
+
+def _get_cached() -> Optional[dict]:
+    """Return cached data if still valid (within TTL)."""
+    global _cached_data, _cache_timestamp
+    with _cache_lock:
+        if _cached_data and _cache_timestamp:
+            age = datetime.now() - _cache_timestamp
+            if age < timedelta(minutes=_CACHE_TTL_MINUTES):
+                logger.info(
+                    f"Cache HIT — using data from {age.seconds // 60}m {age.seconds % 60}s ago "
+                    f"(source: {_cached_data.get('source', '?')})"
+                )
+                return _cached_data.copy()
+    return None
+
+
+def _set_cache(data: dict) -> None:
+    """Store data in cache with current timestamp."""
+    global _cached_data, _cache_timestamp
+    with _cache_lock:
+        _cached_data = data.copy()
+        _cache_timestamp = datetime.now()
+        logger.info(f"Cache SET — stored data from {data.get('source', '?')}")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # NSE URLs — all official NSE domains only
@@ -69,7 +79,11 @@ NSE_FII_DII_API    = "https://www.nseindia.com/api/fiidiiTradeReact"
 # Static file server — no Akamai. Updated EOD by NSE.
 NSE_ARCHIVES_CSV   = "https://nsearchives.nseindia.com/content/fo/fii_dii_data.csv"
 
-# Standard browser headers (used by both tiers)
+# Cloud-friendly sources (no Akamai)
+MONEYCONTROL_FII_DII = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"
+CAPITALMARKET_FII    = "https://www.capitalmarket.com/fii-data-in-equity"
+
+# Standard browser headers (used by all tiers)
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -464,7 +478,342 @@ def _parse_nse_csv(csv_content: str) -> Optional[dict]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TIER 3: Plain requests with session retry
+# TIER 3: MoneyControl HTML scraping (cloud-friendly)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _fetch_moneycontrol() -> Optional[dict]:
+    """
+    Scrape FII/DII data from MoneyControl's FII-DII activity page.
+
+    MoneyControl does NOT use Akamai Bot Manager, so this works
+    reliably from cloud servers (Render, AWS, GCP, etc.).
+
+    The page contains FII/DII cash segment data in HTML tables.
+    We look for patterns in the page text that contain the numbers.
+    """
+    try:
+        # Try the old PHP endpoint first (more likely to have static HTML data)
+        resp = requests.get(
+            MONEYCONTROL_FII_DII,
+            headers={
+                **_BROWSER_HEADERS,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            },
+            timeout=15,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"MoneyControl returned HTTP {resp.status_code}")
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Strategy 1: Look for tables with FII/DII data
+        result = _parse_moneycontrol_tables(soup)
+        if result:
+            return result
+
+        # Strategy 2: Look for JSON data embedded in script tags
+        result = _parse_moneycontrol_scripts(resp.text)
+        if result:
+            return result
+
+        logger.warning("MoneyControl: could not extract FII/DII data from page")
+        return None
+
+    except Exception as e:
+        logger.warning(f"MoneyControl fetch failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _parse_moneycontrol_tables(soup: BeautifulSoup) -> Optional[dict]:
+    """
+    Parse FII/DII data from MoneyControl HTML tables.
+
+    MoneyControl typically shows a table like:
+      Category | Buy Value | Sell Value | Net Value
+      FII/FPI  | 12345.67  | 11234.56   |  1111.11
+      DII      | 9876.54   | 10234.56   | -358.02
+    """
+    tables = soup.find_all("table")
+
+    for table in tables:
+        rows = table.find_all("tr")
+        fii_data = None
+        dii_data = None
+
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 4:
+                continue
+
+            cell_texts = [c.get_text(strip=True) for c in cells]
+            row_text = " ".join(cell_texts).upper()
+
+            # Identify FII row
+            if ("FII" in row_text or "FPI" in row_text) and "DII" not in row_text:
+                values = [_parse_nse_value(c.get_text(strip=True)) for c in cells[1:4]]
+                if any(v != 0.0 for v in values):
+                    fii_data = {
+                        "buy_value":  values[0] if len(values) > 0 else 0.0,
+                        "sell_value": values[1] if len(values) > 1 else 0.0,
+                        "net_value":  values[2] if len(values) > 2 else 0.0,
+                    }
+
+            # Identify DII row
+            elif "DII" in row_text:
+                values = [_parse_nse_value(c.get_text(strip=True)) for c in cells[1:4]]
+                if any(v != 0.0 for v in values):
+                    dii_data = {
+                        "buy_value":  values[0] if len(values) > 0 else 0.0,
+                        "sell_value": values[1] if len(values) > 1 else 0.0,
+                        "net_value":  values[2] if len(values) > 2 else 0.0,
+                    }
+
+        if fii_data or dii_data:
+            result = {
+                "fii": fii_data or {"buy_value": 0.0, "sell_value": 0.0, "net_value": 0.0},
+                "dii": dii_data or {"buy_value": 0.0, "sell_value": 0.0, "net_value": 0.0},
+                "date":      datetime.now().strftime("%d %b %Y"),
+                "source":    "MoneyControl",
+                "estimated": False,
+            }
+            logger.info(
+                f"✅ Tier 3 (MoneyControl table): "
+                f"FII net={result['fii']['net_value']}, "
+                f"DII net={result['dii']['net_value']}"
+            )
+            return result
+
+    return None
+
+
+def _parse_moneycontrol_scripts(html: str) -> Optional[dict]:
+    """
+    Some MoneyControl pages embed JSON data in <script> tags.
+    Try to extract FII/DII numbers from inline JavaScript/JSON.
+    """
+    # Look for patterns like: "netValue":"1234.56" or net_value = 1234.56
+    fii_patterns = [
+        r'"fii"[^}]*"net[_]?[Vv]alue"\s*:\s*"?(-?[\d,.]+)"?',
+        r'"FII[^"]*"[^}]*"net[_]?[Vv]alue"\s*:\s*"?(-?[\d,.]+)"?',
+    ]
+    dii_patterns = [
+        r'"dii"[^}]*"net[_]?[Vv]alue"\s*:\s*"?(-?[\d,.]+)"?',
+        r'"DII"[^}]*"net[_]?[Vv]alue"\s*:\s*"?(-?[\d,.]+)"?',
+    ]
+
+    fii_net = None
+    dii_net = None
+
+    for pattern in fii_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            fii_net = _parse_nse_value(m.group(1))
+            break
+
+    for pattern in dii_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            dii_net = _parse_nse_value(m.group(1))
+            break
+
+    if fii_net is not None or dii_net is not None:
+        result = {
+            "fii": {"buy_value": 0.0, "sell_value": 0.0, "net_value": fii_net or 0.0},
+            "dii": {"buy_value": 0.0, "sell_value": 0.0, "net_value": dii_net or 0.0},
+            "date":      datetime.now().strftime("%d %b %Y"),
+            "source":    "MoneyControl (embedded)",
+            "estimated": False,
+        }
+        logger.info(
+            f"✅ Tier 3 (MoneyControl script): "
+            f"FII net={result['fii']['net_value']}, "
+            f"DII net={result['dii']['net_value']}"
+        )
+        return result
+
+    return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TIER 4: Capital Market / alternative HTML scraping
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _fetch_capitalmarket() -> Optional[dict]:
+    """
+    Scrape FII/DII data from capitalmarket.com.
+
+    This is a simpler financial site that typically doesn't
+    block cloud IPs. Falls back to general HTML table parsing.
+    """
+    try:
+        resp = requests.get(
+            CAPITALMARKET_FII,
+            headers={
+                **_BROWSER_HEADERS,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            },
+            timeout=15,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"CapitalMarket returned HTTP {resp.status_code}")
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Look for tables with FII/DII data
+        tables = soup.find_all("table")
+        for table in tables:
+            rows = table.find_all("tr")
+            fii_data = None
+            dii_data = None
+
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                if len(cells) < 3:
+                    continue
+
+                cell_texts = [c.get_text(strip=True) for c in cells]
+                row_text = " ".join(cell_texts).upper()
+
+                if ("FII" in row_text or "FPI" in row_text or "FOREIGN" in row_text) and "DII" not in row_text:
+                    # Extract numeric values from cells
+                    numbers = []
+                    for c in cells:
+                        val = _parse_nse_value(c.get_text(strip=True))
+                        if val != 0.0:
+                            numbers.append(val)
+
+                    if len(numbers) >= 3:
+                        fii_data = {
+                            "buy_value":  numbers[0],
+                            "sell_value": numbers[1],
+                            "net_value":  numbers[2],
+                        }
+                    elif len(numbers) >= 1:
+                        fii_data = {
+                            "buy_value": 0.0, "sell_value": 0.0,
+                            "net_value": numbers[-1],
+                        }
+
+                elif "DII" in row_text or "DOMESTIC" in row_text:
+                    numbers = []
+                    for c in cells:
+                        val = _parse_nse_value(c.get_text(strip=True))
+                        if val != 0.0:
+                            numbers.append(val)
+
+                    if len(numbers) >= 3:
+                        dii_data = {
+                            "buy_value":  numbers[0],
+                            "sell_value": numbers[1],
+                            "net_value":  numbers[2],
+                        }
+                    elif len(numbers) >= 1:
+                        dii_data = {
+                            "buy_value": 0.0, "sell_value": 0.0,
+                            "net_value": numbers[-1],
+                        }
+
+            if fii_data or dii_data:
+                result = {
+                    "fii": fii_data or {"buy_value": 0.0, "sell_value": 0.0, "net_value": 0.0},
+                    "dii": dii_data or {"buy_value": 0.0, "sell_value": 0.0, "net_value": 0.0},
+                    "date":      datetime.now().strftime("%d %b %Y"),
+                    "source":    "Capital Market",
+                    "estimated": False,
+                }
+                logger.info(
+                    f"✅ Tier 4 (Capital Market): "
+                    f"FII net={result['fii']['net_value']}, "
+                    f"DII net={result['dii']['net_value']}"
+                )
+                return result
+
+        # Also try extracting from raw text (sometimes data is in
+        # paragraphs or divs, not tables)
+        text = soup.get_text()
+        result = _extract_fii_dii_from_text(text, "Capital Market")
+        if result:
+            return result
+
+        logger.warning("CapitalMarket: could not extract FII/DII data")
+        return None
+
+    except Exception as e:
+        logger.warning(f"CapitalMarket fetch failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _extract_fii_dii_from_text(text: str, source_name: str) -> Optional[dict]:
+    """
+    Last-resort extraction: look for FII/DII net values in raw page text.
+
+    Patterns like:
+      "FII net buying of Rs 1,234 crore"
+      "FII sold Rs 2,345.67 crore"
+      "Net FII: -1234.56"
+    """
+    text_lower = text.lower()
+
+    # FII net value patterns
+    fii_net = None
+    fii_patterns = [
+        r'fii[/fpi]*\s*(?:net\s*)?(?:bought?|buying|inflow)\s*(?:of\s*)?(?:rs\.?\s*)?(-?[\d,]+\.?\d*)\s*(?:cr|crore)',
+        r'fii[/fpi]*\s*(?:net\s*)?(?:sold?|selling|outflow)\s*(?:of\s*)?(?:rs\.?\s*)?(-?[\d,]+\.?\d*)\s*(?:cr|crore)',
+        r'net\s*fii[/fpi]*\s*[:=]?\s*(?:rs\.?\s*)?(-?[\d,]+\.?\d*)',
+        r'fii[/fpi]*\s*net\s*[:=]?\s*(?:rs\.?\s*)?(-?[\d,]+\.?\d*)',
+    ]
+
+    for i, pattern in enumerate(fii_patterns):
+        m = re.search(pattern, text_lower)
+        if m:
+            val = _parse_nse_value(m.group(1))
+            # If pattern is "sold/selling", make negative
+            if i == 1 and val > 0:
+                val = -val
+            fii_net = val
+            break
+
+    # DII net value patterns
+    dii_net = None
+    dii_patterns = [
+        r'dii\s*(?:net\s*)?(?:bought?|buying|inflow)\s*(?:of\s*)?(?:rs\.?\s*)?(-?[\d,]+\.?\d*)\s*(?:cr|crore)',
+        r'dii\s*(?:net\s*)?(?:sold?|selling|outflow)\s*(?:of\s*)?(?:rs\.?\s*)?(-?[\d,]+\.?\d*)\s*(?:cr|crore)',
+        r'net\s*dii\s*[:=]?\s*(?:rs\.?\s*)?(-?[\d,]+\.?\d*)',
+        r'dii\s*net\s*[:=]?\s*(?:rs\.?\s*)?(-?[\d,]+\.?\d*)',
+    ]
+
+    for i, pattern in enumerate(dii_patterns):
+        m = re.search(pattern, text_lower)
+        if m:
+            val = _parse_nse_value(m.group(1))
+            if i == 1 and val > 0:
+                val = -val
+            dii_net = val
+            break
+
+    if fii_net is not None or dii_net is not None:
+        result = {
+            "fii": {"buy_value": 0.0, "sell_value": 0.0, "net_value": fii_net or 0.0},
+            "dii": {"buy_value": 0.0, "sell_value": 0.0, "net_value": dii_net or 0.0},
+            "date":      datetime.now().strftime("%d %b %Y"),
+            "source":    f"{source_name} (text)",
+            "estimated": False,
+        }
+        logger.info(
+            f"✅ ({source_name} text extraction): "
+            f"FII net={fii_net}, DII net={dii_net}"
+        )
+        return result
+
+    return None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TIER 5: Plain requests with session retry (NSE)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _fetch_nse_plain_requests(max_retries: int = 2) -> Optional[dict]:
@@ -475,27 +824,6 @@ def _fetch_nse_plain_requests(max_retries: int = 2) -> Optional[dict]:
 
     Uses exponential backoff on failures.
     """
-    # Attempt 0: Pure raw request without session/cookies 
-    # (sometimes bypasses Akamai's HTML/JS traps entirely because it looks like an API call block)
-    try:
-        resp = requests.get(
-            NSE_FII_DII_API,
-            headers={
-                "User-Agent": _BROWSER_HEADERS["User-Agent"],
-                "Accept": "application/json, text/plain, */*",
-            },
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            result = _parse_nse_api_response(resp.json())
-            if result:
-                result["source"] = "NSE India (raw request bypass)"
-                logger.info(f"✅ Tier 3 (raw request): FII net={result['fii']['net_value']}, DII net={result['dii']['net_value']}")
-                return result
-    except Exception as e:
-        logger.debug(f"Raw request bypass failed: {e}")
-
-    # Fallback to session strategy
     for attempt in range(1, max_retries + 1):
         try:
             session = requests.Session()
@@ -547,7 +875,7 @@ def _fetch_nse_plain_requests(max_retries: int = 2) -> Optional[dict]:
             if result:
                 result["source"] = "NSE India (requests)"
                 logger.info(
-                    f"✅ Tier 3 (plain requests): FII net={result['fii']['net_value']}, "
+                    f"✅ Tier 5 (plain requests): FII net={result['fii']['net_value']}, "
                     f"DII net={result['dii']['net_value']}"
                 )
             return result
@@ -623,15 +951,13 @@ def _validate_result(data: dict) -> bool:
 
 def fetch_fii_dii_data() -> dict:
     """
-    Fetch FII/DII data from NSE India with 3-tier fallback.
-    All sources are NSE official domains — no third-party sites.
+    Fetch FII/DII data with 5-tier fallback + in-memory caching.
 
-    Tier 1 (curl_cffi)  : Bypasses Akamai, real-time data.
-                          Best choice during market hours.
-    Tier 2 (NSE CSV)    : Static file server, no Akamai, EOD data.
-                          Reliable fallback, previous day after hours.
-    Tier 3 (requests)   : Plain HTTP, works on some networks.
-                          Last NSE-based attempt before giving up.
+    Tier 1 (curl_cffi)      : Bypasses Akamai, real-time data.
+    Tier 2 (NSE CSV)        : Static file server, no Akamai, EOD data.
+    Tier 3 (MoneyControl)   : Cloud-friendly, no Akamai.
+    Tier 4 (Capital Market) : Cloud-friendly, simple HTML.
+    Tier 5 (requests)       : Plain HTTP NSE, last NSE-based attempt.
 
     Returns
     -------
@@ -649,38 +975,59 @@ def fetch_fii_dii_data() -> dict:
             "error":     str,    # only present if all tiers failed
         }
     """
-    logger.info("Fetching FII/DII data from NSE...")
+    # ── Check cache first ────────────────────────────
+    cached = _get_cached()
+    if cached:
+        return cached
+
+    logger.info("Fetching FII/DII data (cache miss — trying all tiers)...")
 
     # ── Tier 1: curl_cffi ─────────────────────────────
     logger.info("Tier 1: curl_cffi Chrome impersonation...")
     data = _fetch_nse_curl_cffi()
     if data and _validate_result(data):
+        _set_cache(data)
         return data
 
     # ── Tier 2: NSE Archives CSV ──────────────────────
     logger.info("Tier 2: NSE Archives CSV (nsearchives.nseindia.com)...")
     data = _fetch_nse_archives_csv()
     if data and _validate_result(data):
+        _set_cache(data)
         return data
 
-    # ── Tier 3: Plain requests with retry ─────────────
-    logger.info("Tier 3: Plain requests with retry...")
+    # ── Tier 3: MoneyControl ──────────────────────────
+    logger.info("Tier 3: MoneyControl (cloud-friendly)...")
+    data = _fetch_moneycontrol()
+    if data and _validate_result(data):
+        _set_cache(data)
+        return data
+
+    # ── Tier 4: Capital Market ────────────────────────
+    logger.info("Tier 4: Capital Market (cloud-friendly)...")
+    data = _fetch_capitalmarket()
+    if data and _validate_result(data):
+        _set_cache(data)
+        return data
+
+    # ── Tier 5: Plain requests with retry ─────────────
+    logger.info("Tier 5: Plain requests with retry...")
     data = _fetch_nse_plain_requests(max_retries=2)
     if data and _validate_result(data):
+        _set_cache(data)
         return data
 
     # All tiers failed
     logger.error(
-        "All NSE fetch tiers failed. "
-        "Check network connectivity to nseindia.com and nsearchives.nseindia.com."
+        "All FII/DII fetch tiers failed. "
+        "Check network connectivity and source availability."
     )
     return _empty_result(
-        source="NSE (unavailable)",
+        source="All sources unavailable",
         reason=(
-            "All NSE fetch attempts failed. "
-            "Possible causes: network restriction, NSE maintenance, "
-            "or Akamai block. Install curl-cffi for best results: "
-            "pip install curl-cffi"
+            "All FII/DII fetch attempts failed (NSE blocked by Akamai, "
+            "alternative sources unavailable). Data will be retried on next request. "
+            "Install curl-cffi for best results: pip install curl-cffi"
         ),
     )
 
@@ -691,17 +1038,19 @@ def fetch_fii_dii_data() -> dict:
 
 def diagnose_nse_connectivity() -> dict:
     """
-    Run connectivity checks against NSE endpoints.
-    Useful for debugging why scraping is failing.
+    Run connectivity checks against all data source endpoints.
+    Useful for debugging why scraping is failing on cloud.
 
     Returns a dict of endpoint → status.
     """
     results = {}
     endpoints = {
-        "NSE Homepage":     NSE_HOME_URL,
-        "NSE FII/DII Page": NSE_FII_DII_PAGE,
-        "NSE API":          NSE_FII_DII_API,
-        "NSE Archives CSV": NSE_ARCHIVES_CSV,
+        "NSE Homepage":       NSE_HOME_URL,
+        "NSE FII/DII Page":   NSE_FII_DII_PAGE,
+        "NSE API":            NSE_FII_DII_API,
+        "NSE Archives CSV":   NSE_ARCHIVES_CSV,
+        "MoneyControl":       MONEYCONTROL_FII_DII,
+        "Capital Market":     CAPITALMARKET_FII,
     }
 
     for name, url in endpoints.items():
@@ -726,13 +1075,26 @@ def diagnose_nse_connectivity() -> dict:
         import curl_cffi
         results["curl_cffi"] = {
             "installed": True,
-            "version": curl_cffi.__version__,
+            "version": getattr(curl_cffi, "__version__", "unknown"),
         }
     except ImportError:
         results["curl_cffi"] = {
             "installed": False,
             "note": "Install with: pip install curl-cffi",
         }
+
+    # Cache status
+    with _cache_lock:
+        if _cached_data and _cache_timestamp:
+            age = datetime.now() - _cache_timestamp
+            results["cache"] = {
+                "has_data": True,
+                "age_seconds": int(age.total_seconds()),
+                "source": _cached_data.get("source", "?"),
+                "ttl_remaining": max(0, _CACHE_TTL_MINUTES * 60 - int(age.total_seconds())),
+            }
+        else:
+            results["cache"] = {"has_data": False}
 
     return results
 
@@ -756,7 +1118,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.diagnose:
-        print("\n=== NSE Connectivity Diagnostics ===")
+        print("\n=== FII/DII Source Connectivity Diagnostics ===")
         diag = diagnose_nse_connectivity()
         print(json.dumps(diag, indent=2))
     else:
