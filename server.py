@@ -1,7 +1,7 @@
 """
 server.py — Flask application for NIFTY Market Analysis Dashboard.
 Serves the dashboard UI and provides the /api/analyze endpoint.
-Now includes FII/DII data and Intraday predictions alongside BTST.
+Includes Intraday predictions alongside BTST.
 """
 
 import json
@@ -11,7 +11,6 @@ from flask import Flask, render_template, jsonify
 
 from scraper import scrape_all_news
 from analyzer import analyze_news
-from fii_dii_scraper import fetch_fii_dii_data
 from intraday_analyzer import generate_intraday_prediction
 
 logging.basicConfig(
@@ -32,7 +31,7 @@ def index():
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
     """
-    Trigger full news scraping + FII/DII fetch + sentiment analysis
+    Trigger full news scraping + sentiment analysis
     + intraday prediction. Returns the complete prediction JSON.
     """
     try:
@@ -43,27 +42,17 @@ def analyze():
         news_items = scrape_all_news()
         logger.info(f"Scraped {len(news_items)} news items.")
 
-        # Phase 2: Fetch FII/DII data
-        logger.info("Phase 2: Fetching FII/DII institutional flow data...")
-        fii_dii_data = fetch_fii_dii_data()
-        logger.info(
-            f"FII/DII data: FII Net={fii_dii_data['fii']['net_value']}, "
-            f"DII Net={fii_dii_data['dii']['net_value']} "
-            f"(Source: {fii_dii_data.get('source', 'Unknown')})"
-        )
-
-        # Phase 3: Analyze sentiment (BTST prediction)
-        logger.info("Phase 3: Running sentiment analysis (BTST)...")
-        result = analyze_news(news_items, fii_dii_data=fii_dii_data)
+        # Phase 2: Analyze sentiment (BTST prediction)
+        logger.info("Phase 2: Running sentiment analysis (BTST)...")
+        result = analyze_news(news_items)
         logger.info(
             f"BTST Analysis — Prediction: {result['prediction']}, "
             f"Confidence: {result['confidence']}%"
         )
 
-        # Phase 4: Generate intraday prediction
-        logger.info("Phase 4: Generating intraday prediction...")
+        # Phase 3: Generate intraday prediction
+        logger.info("Phase 3: Generating intraday prediction...")
         intraday = generate_intraday_prediction(
-            fii_dii_data=fii_dii_data,
             news_sentiment=result["news_sentiment"],
             gap_prediction=result["prediction"],
             event_risk=result["event_risk"],
@@ -79,7 +68,6 @@ def analyze():
         )
 
         # Merge everything into the result
-        result["fii_dii"] = fii_dii_data
         result["intraday"] = intraday
 
         return jsonify({"status": "success", "data": result})
@@ -102,7 +90,7 @@ def health():
 if __name__ == "__main__":
     print("\n" + "━" * 60)
     print("  🚀 NIFTY Market Analysis Dashboard")
-    print("  📊 BTST + Intraday + FII/DII Intelligence")
+    print("  📊 BTST + Intraday Intelligence")
     print("  🌐 Open: http://localhost:5000")
     print("━" * 60 + "\n")
     app.run(debug=True, host="0.0.0.0", port=5000)
