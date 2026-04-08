@@ -1,27 +1,18 @@
 """
 intraday_analyzer.py — Intraday market movement prediction engine.
 
-Combines news sentiment, FII/DII flows, global cues, and time-of-day
-factors to generate intraday trading predictions for NIFTY 50.
+Combines news sentiment, global cues, and time-of-day factors to
+generate intraday trading predictions for NIFTY 50.
 
 Rules & Conditions (based on professional trading heuristics):
 ─────────────────────────────────────────────────────────────────
-1. FII/DII FLOW RULES:
-   - FII net buy > 1000 Cr → Strong bullish signal (+3)
-   - FII net buy > 500 Cr  → Moderate bullish (+2)
-   - FII net sell > 1000 Cr → Strong bearish (-3)
-   - FII net sell > 500 Cr  → Moderate bearish (-2)
-   - DII buying while FII selling → Support level; reduces bearish (-1)
-   - Both FII+DII buying → Very bullish (+4)
-   - Both FII+DII selling → Very bearish (-4)
-
-2. NEWS SENTIMENT IMPACT ON INTRADAY:
-   - Strong bullish news + FII buying → Trending day up
-   - Strong bearish news + FII selling → Trending day down
+1. NEWS SENTIMENT IMPACT ON INTRADAY:
+   - Strong bullish news → Trending day up
+   - Strong bearish news → Trending day down
    - Mixed signals → Range-bound / choppy day
    - Event risk HIGH → Volatile / whipsaw expected
 
-3. TIME-OF-DAY FACTORS:
+2. TIME-OF-DAY FACTORS:
    - Pre-market (before 9:15) → Gap prediction is key
    - First 30 min (9:15-9:45) → High volatility, gap fill or gap extension
    - Mid-morning (9:45-11:30) → Trend formation phase
@@ -29,7 +20,7 @@ Rules & Conditions (based on professional trading heuristics):
    - Afternoon (1:30-3:00) → Institutional activity, closing trend
    - Last 15 min (3:00-3:30) → Short covering / profit booking
 
-4. INTRADAY PATTERNS:
+3. INTRADAY PATTERNS:
    - Gap Up + Bullish → Buy on dips (support at gap)
    - Gap Up + Bearish → Possible gap fill, sell on rise
    - Gap Down + Bearish → Sell on rise (resistance at gap)
@@ -37,12 +28,11 @@ Rules & Conditions (based on professional trading heuristics):
    - Flat + Strong sentiment → Trending move expected
    - Flat + Mixed → Range-bound, sell CE + PE (option selling)
 
-5. VOLATILITY ESTIMATION:
-   - High FII activity (abs(net) > 2000 Cr) → High volatility
-   - Event risk + FII activity → Extreme volatility
+4. VOLATILITY ESTIMATION:
+   - Event risk + strong sentiment → High volatility
    - Low activity + no events → Low volatility (option selling opportunity)
 
-6. SUPPORT & RESISTANCE LOGIC (estimated from sentiment):
+5. SUPPORT & RESISTANCE LOGIC (estimated from sentiment):
    - Strong bullish: Support well-defined, resistance breakout possible
    - Strong bearish: Resistance strong, support breakdown possible
    - Mixed: Both levels respected, range-bound
@@ -56,77 +46,6 @@ logger = logging.getLogger(__name__)
 
 # IST timezone offset
 IST = timezone(timedelta(hours=5, minutes=30))
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Intraday Score from FII/DII Data
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _score_fii_dii(fii_dii_data: dict) -> tuple[float, list[str]]:
-    """
-    Score FII/DII data for intraday impact.
-    Returns (score, factors_list).
-    """
-    score = 0.0
-    factors = []
-
-    fii_net = fii_dii_data.get("fii", {}).get("net_value", 0)
-    dii_net = fii_dii_data.get("dii", {}).get("net_value", 0)
-
-    # ── FII scoring ──
-    if fii_net > 2000:
-        score += 4
-        factors.append(f"FII heavy buying (₹{fii_net:,.0f} Cr) — Very bullish institutional flow")
-    elif fii_net > 1000:
-        score += 3
-        factors.append(f"FII strong buying (₹{fii_net:,.0f} Cr) — Bullish institutional support")
-    elif fii_net > 500:
-        score += 2
-        factors.append(f"FII moderate buying (₹{fii_net:,.0f} Cr) — Positive foreign flow")
-    elif fii_net > 0:
-        score += 1
-        factors.append(f"FII marginal buying (₹{fii_net:,.0f} Cr) — Mild support")
-    elif fii_net < -2000:
-        score -= 4
-        factors.append(f"FII heavy selling (₹{fii_net:,.0f} Cr) — Very bearish institutional flow")
-    elif fii_net < -1000:
-        score -= 3
-        factors.append(f"FII strong selling (₹{fii_net:,.0f} Cr) — Bearish foreign exit")
-    elif fii_net < -500:
-        score -= 2
-        factors.append(f"FII moderate selling (₹{fii_net:,.0f} Cr) — Negative foreign flow")
-    elif fii_net < 0:
-        score -= 1
-        factors.append(f"FII marginal selling (₹{fii_net:,.0f} Cr) — Mild pressure")
-
-    # ── DII scoring ──
-    if dii_net > 1500:
-        score += 2
-        factors.append(f"DII strong buying (₹{dii_net:,.0f} Cr) — Domestic support forming floor")
-    elif dii_net > 500:
-        score += 1
-        factors.append(f"DII buying (₹{dii_net:,.0f} Cr) — Domestic cushion available")
-    elif dii_net < -1500:
-        score -= 2
-        factors.append(f"DII selling (₹{dii_net:,.0f} Cr) — Even domestic institutions bearish")
-    elif dii_net < -500:
-        score -= 1
-        factors.append(f"DII moderate selling (₹{dii_net:,.0f} Cr) — Domestic concerns rising")
-
-    # ── Combined patterns ──
-    if fii_net > 500 and dii_net > 500:
-        score += 2
-        factors.append("Both FII+DII buying — Twin institutional support (very bullish)")
-    elif fii_net < -500 and dii_net < -500:
-        score -= 2
-        factors.append("Both FII+DII selling — No institutional support (very bearish)")
-    elif fii_net < -500 and dii_net > 500:
-        score += 1  # DII providing support
-        factors.append("DII buying counters FII selling — Domestic support cushioning fall")
-    elif fii_net > 500 and dii_net < -500:
-        factors.append("FII buying but DII selling — Foreign bullish, domestic cautious")
-
-    return score, factors
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -205,24 +124,24 @@ def _get_market_phase() -> dict:
 def _detect_intraday_pattern(
     gap_prediction: str,
     news_sentiment: str,
-    fii_score: float,
+    sentiment_score: float,
     event_risk: str,
 ) -> dict:
     """
     Detect the expected intraday pattern based on gap prediction,
-    sentiment, and FII/DII flows.
+    sentiment, and news scores.
     """
     # Pattern matrix
     if gap_prediction == "GAP UP":
-        if news_sentiment == "BULLISH" and fii_score > 2:
+        if news_sentiment == "BULLISH" and sentiment_score > 5:
             return {
                 "pattern": "TRENDING UP",
-                "description": "Strong gap up with bullish sentiment and institutional buying. Expect a trending up day with higher highs.",
+                "description": "Strong gap up with bullish sentiment. Expect a trending up day with higher highs.",
                 "strategy": "Buy on dips. Trail stop-loss at opening price. Target: 1-1.5% above open.",
                 "option_strategy": "Buy CE at opening dip. Sell PE for premium collection.",
                 "risk_level": "MODERATE",
             }
-        elif news_sentiment == "BEARISH" or fii_score < -1:
+        elif news_sentiment == "BEARISH":
             return {
                 "pattern": "GAP FILL",
                 "description": "Gap up against bearish pressure. High probability of gap fill during the day.",
@@ -240,15 +159,15 @@ def _detect_intraday_pattern(
             }
 
     elif gap_prediction == "GAP DOWN":
-        if news_sentiment == "BEARISH" and fii_score < -2:
+        if news_sentiment == "BEARISH" and sentiment_score < -5:
             return {
                 "pattern": "TRENDING DOWN",
-                "description": "Strong gap down with bearish sentiment and institutional selling. Expect a trending down day with lower lows.",
+                "description": "Strong gap down with bearish sentiment. Expect a trending down day with lower lows.",
                 "strategy": "Sell on rise. Trail stop-loss at opening price. Target: 1-1.5% below open.",
                 "option_strategy": "Buy PE at opening bounce. Sell CE for premium collection.",
                 "risk_level": "MODERATE",
             }
-        elif news_sentiment == "BULLISH" or fii_score > 1:
+        elif news_sentiment == "BULLISH":
             return {
                 "pattern": "GAP FILL UP",
                 "description": "Gap down against bullish support. High probability of gap fill recovery during the day.",
@@ -274,13 +193,13 @@ def _detect_intraday_pattern(
                 "option_strategy": "Buy straddle/strangle for volatility play. Avoid directional bets.",
                 "risk_level": "VERY HIGH",
             }
-        elif abs(fii_score) > 3:
-            direction = "UPWARD" if fii_score > 0 else "DOWNWARD"
+        elif abs(sentiment_score) > 10:
+            direction = "UPWARD" if sentiment_score > 0 else "DOWNWARD"
             return {
                 "pattern": f"BREAKOUT {direction}",
-                "description": f"Flat opening but strong institutional flow suggests {direction.lower()} breakout during the day.",
-                "strategy": f"Wait for breakout confirmation past opening range. Trade in direction of institutional flow.",
-                "option_strategy": f"Buy {'CE' if fii_score > 0 else 'PE'} after opening range breakout for trending move.",
+                "description": f"Flat opening but strong news sentiment suggests {direction.lower()} breakout during the day.",
+                "strategy": f"Wait for breakout confirmation past opening range. Trade in direction of sentiment.",
+                "option_strategy": f"Buy {'CE' if sentiment_score > 0 else 'PE'} after opening range breakout for trending move.",
                 "risk_level": "MODERATE",
             }
         elif news_sentiment == "MIXED":
@@ -307,7 +226,6 @@ def _detect_intraday_pattern(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _estimate_volatility(
-    fii_dii_data: dict,
     event_risk: str,
     news_count: int,
     sentiment_score_diff: float,
@@ -315,17 +233,10 @@ def _estimate_volatility(
     """Estimate intraday volatility level."""
     vol_score = 0
 
-    fii_net = abs(fii_dii_data.get("fii", {}).get("net_value", 0))
-    dii_net = abs(fii_dii_data.get("dii", {}).get("net_value", 0))
-
-    # FII/DII activity volume
-    if fii_net > 3000:
-        vol_score += 4
-    elif fii_net > 1500:
-        vol_score += 3
-    elif fii_net > 500:
+    # Base volatility from news volume
+    if news_count > 80:
         vol_score += 2
-    else:
+    elif news_count > 40:
         vol_score += 1
 
     # Event risk
@@ -336,8 +247,10 @@ def _estimate_volatility(
 
     # News sentiment divergence
     if abs(sentiment_score_diff) > 20:
-        vol_score += 2
+        vol_score += 3
     elif abs(sentiment_score_diff) > 10:
+        vol_score += 2
+    elif abs(sentiment_score_diff) > 5:
         vol_score += 1
 
     # Apply market phase factor
@@ -375,14 +288,13 @@ def _estimate_volatility(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _generate_intraday_bias(
-    fii_score: float,
     news_score_diff: float,
     event_risk: str,
     volatility_level: str,
     gap_prediction: str,
 ) -> dict:
     """Generate the intraday trading bias and actionable levels."""
-    total_score = fii_score + (news_score_diff / 5)  # Normalize news score
+    total_score = news_score_diff / 5  # Normalize news score
 
     if event_risk == "HIGH" or volatility_level == "EXTREME":
         bias = "VOLATILE — AVOID"
@@ -449,7 +361,6 @@ def _generate_intraday_bias(
 
 
 def generate_intraday_prediction(
-    fii_dii_data: dict,
     news_sentiment: str,
     gap_prediction: str,
     event_risk: str,
@@ -459,12 +370,10 @@ def generate_intraday_prediction(
     sector_summary: list[dict],
 ) -> dict[str, Any]:
     """
-    Generate complete intraday prediction using all available data.
+    Generate complete intraday prediction using available data.
 
     Parameters
     ----------
-    fii_dii_data : dict
-        FII/DII flow data from fii_dii_scraper.
     news_sentiment : str
         Overall news sentiment (BULLISH/BEARISH/MIXED).
     gap_prediction : str
@@ -485,31 +394,30 @@ def generate_intraday_prediction(
     """
     logger.info("Generating intraday prediction...")
 
-    # ── FII/DII impact scoring ──
-    fii_score, fii_factors = _score_fii_dii(fii_dii_data)
-
     # ── Market phase ──
     market_phase = _get_market_phase()
 
+    # ── Sentiment score ──
+    score_diff = scores.get("net_score", 0)
+    news_count = scores.get("total_bullish", 0) + scores.get("total_bearish", 0)
+
     # ── Intraday pattern ──
     intraday_pattern = _detect_intraday_pattern(
-        gap_prediction, news_sentiment, fii_score, event_risk,
+        gap_prediction, news_sentiment, score_diff, event_risk,
     )
 
     # ── Volatility estimation ──
-    score_diff = scores.get("net_score", 0)
-    news_count = scores.get("total_bullish", 0) + scores.get("total_bearish", 0)
     volatility = _estimate_volatility(
-        fii_dii_data, event_risk, int(news_count), score_diff,
+        event_risk, int(news_count), score_diff,
     )
 
     # ── Intraday bias ──
     intraday_bias = _generate_intraday_bias(
-        fii_score, score_diff, event_risk, volatility["level"], gap_prediction,
+        score_diff, event_risk, volatility["level"], gap_prediction,
     )
 
     # ── Key intraday drivers ──
-    intraday_drivers = fii_factors.copy()
+    intraday_drivers = []
 
     # Add news-based drivers
     if news_sentiment == "BULLISH":
@@ -521,6 +429,14 @@ def generate_intraday_prediction(
 
     if event_risk == "HIGH":
         intraday_drivers.append("⚠️ HIGH EVENT RISK — Market can whipsaw violently. Reduce position sizes!")
+
+    # Add score context
+    if abs(score_diff) > 15:
+        direction = "bullish" if score_diff > 0 else "bearish"
+        intraday_drivers.append(f"Strong {direction} sentiment score ({score_diff:+.1f}) — trending day likely")
+    elif abs(score_diff) > 5:
+        direction = "bullish" if score_diff > 0 else "bearish"
+        intraday_drivers.append(f"Moderate {direction} sentiment score ({score_diff:+.1f})")
 
     # Add sector highlights relevant to intraday
     bullish_sectors = [s["sector"] for s in sector_summary if s.get("sentiment") == "BULLISH"]
@@ -534,7 +450,7 @@ def generate_intraday_prediction(
     # ── Intraday summary ──
     summary = _generate_intraday_summary(
         intraday_bias, intraday_pattern, market_phase,
-        fii_dii_data, volatility, event_risk,
+        volatility, event_risk, score_diff,
     )
 
     return {
@@ -542,10 +458,6 @@ def generate_intraday_prediction(
         "intraday_pattern": intraday_pattern,
         "market_phase": market_phase,
         "volatility": volatility,
-        "fii_dii_impact": {
-            "score": round(fii_score, 1),
-            "factors": fii_factors,
-        },
         "intraday_drivers": intraday_drivers[:8],
         "intraday_summary": summary,
     }
@@ -555,23 +467,20 @@ def _generate_intraday_summary(
     bias: dict,
     pattern: dict,
     phase: dict,
-    fii_dii: dict,
     volatility: dict,
     event_risk: str,
+    score_diff: float,
 ) -> str:
     """Generate a human-readable intraday summary."""
     parts = []
 
-    fii_net = fii_dii.get("fii", {}).get("net_value", 0)
-    dii_net = fii_dii.get("dii", {}).get("net_value", 0)
-
-    # FII/DII summary
-    fii_dir = "bought" if fii_net > 0 else "sold"
-    dii_dir = "bought" if dii_net > 0 else "sold"
-    parts.append(
-        f"FIIs {fii_dir} ₹{abs(fii_net):,.0f} Cr and DIIs {dii_dir} ₹{abs(dii_net):,.0f} Cr "
-        f"({fii_dii.get('source', 'Unknown source')})."
-    )
+    # Sentiment summary
+    if score_diff > 5:
+        parts.append(f"News sentiment is bullish with a net positive score of +{score_diff:.1f}.")
+    elif score_diff < -5:
+        parts.append(f"News sentiment is bearish with a net negative score of {score_diff:.1f}.")
+    else:
+        parts.append("News sentiment is mixed with no clear directional bias.")
 
     # Bias
     parts.append(f"Intraday bias is {bias['bias']} with {bias['confidence']}% confidence.")
